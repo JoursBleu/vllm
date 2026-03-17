@@ -128,7 +128,7 @@ class GGUFModelLoader(BaseModelLoader):
             # Gemma3 models use "gemma3_text" in HuggingFace but
             # "gemma3" in GGUF architecture naming
             model_type = "gemma3"
-        if model_type in ("deepseek_v3", "deepseek_v2"):
+        if model_type in ("deepseek_v32", "deepseek_v3", "deepseek_v2"):
             model_type = "deepseek2"
             # GGUF layer map assumes that we will have a merged expert weights
             # so we need to map them manually
