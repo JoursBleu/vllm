@@ -20,6 +20,7 @@ from vllm.model_executor.layers.fused_moe.activation import (
     apply_moe_activation,
 )
 from vllm.model_executor.layers.fused_moe.config import (
+    FUSED_MOE_UNQUANTIZED_CONFIG,
     FusedMoEConfig,
     FusedMoEQuantConfig,
 )
@@ -42,7 +43,7 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
 from vllm.model_executor.models.utils import WeightsMapper
-from vllm.model_executor.utils import set_weight_attrs
+from vllm.model_executor.utils import replace_parameter, set_weight_attrs
 from vllm.platforms import current_platform
 from vllm.utils.torch_utils import direct_register_custom_op
 
@@ -564,6 +565,11 @@ class GGUFLinearMethod(LinearMethodBase):
 class GGUFMoEMethod(FusedMoEMethodBase):
     """MoE method for GGUF.
 
+    Loads weights in GGML quantized format, then dequantizes to FP16 and
+    uses vLLM's standard fused MoE kernels (triton/CK/AITER) for inference.
+    This provides significantly better throughput at high batch sizes compared
+    to the GGML custom MoE kernels.
+
     Args:
         quant_config: The GGUF quantization config.
     """
@@ -575,6 +581,22 @@ class GGUFMoEMethod(FusedMoEMethodBase):
     ):
         super().__init__(moe)
         self.quant_config = quant_config
+        # Lazy-import to avoid circular dependencies
+        from vllm.model_executor.layers.fused_moe.oracle.unquantized import (
+            convert_to_unquantized_kernel_format,
+            make_unquantized_moe_kernel,
+            select_unquantized_moe_backend,
+        )
+        self._convert_to_unquantized_kernel_format = (
+            convert_to_unquantized_kernel_format
+        )
+        self._make_unquantized_moe_kernel = make_unquantized_moe_kernel
+        self.unquantized_backend = select_unquantized_moe_backend(
+            moe_config=self.moe,
+            use_ep=self.moe.moe_parallel_config.use_ep,
+            use_dp=self.moe.moe_parallel_config.dp_size > 1,
+        )
+        self.kernel = None
 
     def create_weights(
         self,
@@ -585,6 +607,7 @@ class GGUFMoEMethod(FusedMoEMethodBase):
         params_dtype: torch.dtype,
         **extra_weight_attrs,
     ):
+        self.params_dtype = params_dtype
         tensor_shape = (num_experts, 2 * intermediate_size_per_partition, hidden_size)
         # gate up proj
         w13_qweight = GGUFUninitializedParameter(requires_grad=False)
@@ -638,10 +661,122 @@ class GGUFMoEMethod(FusedMoEMethodBase):
         set_weight_attrs(w2_qweight_type, extra_weight_attrs)
         layer.register_parameter("w2_qweight_type", w2_qweight_type)
 
+    def _dequantize_experts(
+        self, qweight: torch.Tensor, qweight_type: int, dtype: torch.dtype
+    ) -> torch.Tensor:
+        """Dequantize GGML expert weights to dense FP16/BF16 tensor.
+
+        GGML stores weights as (num_experts, N, K_quant) where N is the output
+        dimension (rows) and K_quant is the compressed input dimension.
+        ggml_dequantize(W, type, m, n) takes m=rows, n=cols and returns (m, n).
+
+        Args:
+            qweight: Quantized weight tensor of shape (num_experts, N, K_quant)
+            qweight_type: GGML quantization type
+            dtype: Target dtype (e.g. torch.float16)
+
+        Returns:
+            Dequantized weight tensor of shape (num_experts, N, K)
+        """
+        if qweight_type in UNQUANTIZED_TYPES:
+            return qweight.to(dtype)
+
+        num_experts = qweight.shape[0]
+        block_size, type_size = gguf.GGML_QUANT_SIZES[qweight_type]
+        N = qweight.shape[1]  # output dim (rows)
+        K = qweight.shape[2] // type_size * block_size  # input dim (cols)
+
+        dequantized = torch.empty(
+            (num_experts, N, K), dtype=dtype, device=qweight.device
+        )
+        for i in range(num_experts):
+            # ggml_dequantize returns (m, n) where m=N (rows), n=K (cols)
+            dequantized[i] = ops.ggml_dequantize(
+                qweight[i], qweight_type, N, K, dtype
+            )
+        return dequantized
+
+    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        """Dequantize GGML weights and setup standard fused MoE kernel."""
+        dtype = self.params_dtype
+        w13_qweight = layer.w13_qweight
+        w2_qweight = layer.w2_qweight
+        w13_type = layer.w13_qweight_type.weight_type
+        w2_type = layer.w2_qweight_type.weight_type
+
+        logger.info(
+            "GGUF MoE: dequantizing experts to %s for fused MoE kernel "
+            "(w13: %s, w2: %s)",
+            dtype, WeightType(w13_type).name, WeightType(w2_type).name,
+        )
+
+        # Dequantize to dense FP16
+        # Both GGML and standard fused MoE store weights as (E, N, K) where
+        # N=out_features, K=in_features (used as x @ W.T in both paths).
+        w13_weight = self._dequantize_experts(w13_qweight, w13_type, dtype)
+        w2_weight = self._dequantize_experts(w2_qweight, w2_type, dtype)
+        logger.info(
+            "GGUF MoE: dequantized shapes - w13: %s, w2: %s",
+            w13_weight.shape, w2_weight.shape,
+        )
+
+        # Register as standard weight parameters
+        w13_param = Parameter(w13_weight, requires_grad=False)
+        w2_param = Parameter(w2_weight, requires_grad=False)
+        layer.register_parameter("w13_weight", w13_param)
+        layer.register_parameter("w2_weight", w2_param)
+
+        # Remove quantized weights to free memory
+        del layer.w13_qweight
+        del layer.w2_qweight
+        del layer.w13_qweight_type
+        del layer.w2_qweight_type
+        import gc
+        gc.collect()
+        torch.cuda.empty_cache()
+
+        # Padding optimization on ROCm
+        import vllm.envs as envs
+        import torch.nn.functional as F
+        if (
+            envs.VLLM_ROCM_MOE_PADDING
+            and current_platform.is_rocm()
+            and layer.w13_weight.data.stride(-1) == 1
+            and (layer.w13_weight.data.stride(-2)
+                 * layer.w13_weight.data.element_size()) % 512 == 0
+        ):
+            num_pad = 256 // layer.w13_weight.data.element_size()
+            layer.w13_weight.data = F.pad(
+                layer.w13_weight.data, (0, num_pad), "constant", 0
+            )[..., :-num_pad]
+            layer.w2_weight.data = F.pad(
+                layer.w2_weight.data, (0, num_pad), "constant", 0
+            )[..., :-num_pad]
+            torch.cuda.empty_cache()
+
+        # Convert to kernel format and setup kernel
+        w13, w2 = self._convert_to_unquantized_kernel_format(
+            self.unquantized_backend,
+            layer=layer,
+            w13_weight=layer.w13_weight,
+            w2_weight=layer.w2_weight,
+        )
+        replace_parameter(layer, "w13_weight", w13)
+        replace_parameter(layer, "w2_weight", w2)
+
+        self.moe_quant_config = FUSED_MOE_UNQUANTIZED_CONFIG
+        self.kernel = self._make_unquantized_moe_kernel(
+            backend=self.unquantized_backend,
+            quant_config=self.moe_quant_config,
+            moe_config=self.moe,
+        )
+        logger.info("GGUF MoE: standard fused MoE kernel ready (backend=%s)",
+                     self.unquantized_backend)
+
     def get_fused_moe_quant_config(
         self, layer: torch.nn.Module
     ) -> FusedMoEQuantConfig | None:
-        return None
+        return FUSED_MOE_UNQUANTIZED_CONFIG
 
     def apply(
         self,
@@ -657,15 +792,22 @@ class GGUFMoEMethod(FusedMoEMethodBase):
                 "fused GGUF MoE method."
             )
 
-        return fused_moe_gguf(
-            x,
-            layer.w13_qweight,
-            layer.w2_qweight,
-            topk_weights,
-            topk_ids,
-            layer.w13_qweight_type.weight_type,
-            layer.w2_qweight_type.weight_type,
-            layer.activation.value,
+        assert self.kernel is not None, (
+            "GGUF MoE kernel not initialized. "
+            "process_weights_after_loading must be called first."
+        )
+
+        return self.kernel.apply(
+            hidden_states=x,
+            w1=layer.w13_weight,
+            w2=layer.w2_weight,
+            topk_weights=topk_weights,
+            topk_ids=topk_ids,
+            activation=layer.activation,
+            apply_router_weight_on_input=layer.apply_router_weight_on_input,
+            global_num_experts=layer.global_num_experts,
+            expert_map=layer.expert_map,
+            shared_experts_input=shared_experts_input,
         )
 
 
