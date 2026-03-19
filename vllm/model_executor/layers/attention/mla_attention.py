@@ -2149,6 +2149,8 @@ class MLACommonImpl(MLAAttentionImpl[M], Generic[M]):
                 self.flash_attn_varlen_func = functools.partial(
                     flash_attn_varlen_func, fa_version=self.vllm_flash_attn_version
                 )
+            else:
+                self.flash_attn_varlen_func = _fa_func
 
             # For MLA the v head dim is smaller than qk head dim so we pad out
             # v with 0s to match the qk head dim for attention backends that do

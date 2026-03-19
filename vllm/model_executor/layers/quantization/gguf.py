@@ -538,9 +538,10 @@ class GGUFLinearMethod(LinearMethodBase):
     ) -> torch.Tensor:
         shard_id = layer.qweight.shard_id
 
+
         if shard_id:
             # dequantize shard weights respectively
-            shard_id = ["q", "k", "v"] if "q" in shard_id else shard_id
+            shard_id = ["q", "k", "v"] if "q" in shard_id else sorted(shard_id)
             qweight = layer.qweight
             result = []
             for idx in shard_id:

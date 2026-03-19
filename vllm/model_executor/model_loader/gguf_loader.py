@@ -141,12 +141,31 @@ class GGUFModelLoader(BaseModelLoader):
                 gguf_to_hf_name_map[f"blk.{idx}.ffn_up_exps.weight"] = (
                     f"model.layers.{idx}.mlp.experts.0.up_proj.weight"
                 )
+                # GGUF stores separate k_b and v_b tensors, but
+                # the HF model has a fused kv_b_proj. Map the
+                # separate GGUF tensors to HF-style names so the
+                # weight iterator yields them; deepseek_v2
+                # load_weights will merge them into kv_b_proj.
+                gguf_to_hf_name_map[f"blk.{idx}.attn_k_b.weight"] = (
+                    f"model.layers.{idx}.self_attn.k_b_proj.weight"
+                )
+                gguf_to_hf_name_map[f"blk.{idx}.attn_v_b.weight"] = (
+                    f"model.layers.{idx}.self_attn.v_b_proj.weight"
+                )
                 sideload_params.append(
                     re.compile(
                         f"model\\.layers\\.{idx}"
                         r"\.mlp\.experts\.[0-9]+\.(gate|up|down)_proj\.weight"
                     )
                 )
+            # k_b_proj and v_b_proj are synthetic HF names
+            # (the HF model uses fused kv_b_proj instead).
+            # Mark as sideloaded to avoid unmapped-param error.
+            sideload_params.append(
+                re.compile(
+                    r"model\.layers\.[0-9]+\.self_attn\.(k_b|v_b)_proj\.weight"
+                )
+            )
         if model_type in ("qwen2_moe", "qwen3_moe"):
             model_type = model_type.replace("_", "")
             # GGUF layer map assumes that we will have a merged expert weights
@@ -430,4 +449,24 @@ class GGUFModelLoader(BaseModelLoader):
             self.load_weights(model, model_config)
 
             process_weights_after_loading(model, model_config, target_device)
+
+            # Force-materialize any remaining GGUFUninitializedParameter to zeros
+            # NOTE: This MUST run after process_weights_after_loading,
+            # which materializes MergedColumnParallelLinear params from data_container.
+            for name, param in model.named_parameters():
+                if (isinstance(param, torch.nn.parameter.UninitializedParameter)
+                        or (hasattr(param, '__class__')
+                            and 'GGUFUninitializedParameter'
+                            in param.__class__.__name__)):
+                    import logging
+                    shape_hint = getattr(param, '_shape_hint', 'unknown')
+                    logging.warning(
+                        "Force-materializing uninitialized param: "
+                        "%s shape hint=%s", name, shape_hint)
+                    if hasattr(param, 'materialize'):
+                        param.materialize(
+                            param._shape_hint
+                            if hasattr(param, '_shape_hint')
+                            else (1,))
+                        param.data.zero_()
         return model

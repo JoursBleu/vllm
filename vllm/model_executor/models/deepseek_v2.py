@@ -1448,9 +1448,93 @@ class DeepseekV2ForCausalLM(
 
         params_dict = dict(self.named_parameters())
         loaded_params: set[str] = set()
+
+        # Buffer for merging k_b_proj + v_b_proj -> kv_b_proj
+        k_b_v_b_buffer: dict[str, dict[str, torch.Tensor]] = {}
+
         for name, loaded_weight in weights:
             if "rotary_emb.inv_freq" in name:
                 continue
+
+            # Intercept k_b_proj / v_b_proj and merge into kv_b_proj
+            if "k_b_proj.weight" in name or "v_b_proj.weight" in name:
+                import re as _re
+                layer_match = _re.search(r'layers\.(\d+)\.', name)
+                if layer_match:
+                    layer_idx = layer_match.group(1)
+                    if layer_idx not in k_b_v_b_buffer:
+                        k_b_v_b_buffer[layer_idx] = {}
+                    if "k_b_proj" in name:
+                        k_b_v_b_buffer[layer_idx]["k_b"] = loaded_weight
+                    else:
+                        k_b_v_b_buffer[layer_idx]["v_b"] = loaded_weight
+
+                    # When both are available, merge and load
+                    if "k_b" in k_b_v_b_buffer[layer_idx] and "v_b" in k_b_v_b_buffer[layer_idx]:
+                        k_b = k_b_v_b_buffer[layer_idx]["k_b"]
+                        v_b = k_b_v_b_buffer[layer_idx]["v_b"]
+
+                        num_heads = k_b.shape[0]
+                        kv_lora_rank = k_b.shape[1]
+
+                        # TP sharding: select only the heads for this rank
+                        tp_size = get_tensor_model_parallel_world_size()
+                        tp_rank = get_tensor_model_parallel_rank()
+                        heads_per_rank = num_heads // tp_size
+                        head_start = tp_rank * heads_per_rank
+                        head_end = head_start + heads_per_rank
+
+                        k_b_local = k_b[head_start:head_end]
+                        v_b_local = v_b[head_start:head_end]
+
+                        # k_b_local: [local_heads, kv_lora_rank, qk_nope_head_dim]
+                        #   -> permute(0,2,1) -> [local_heads, qk_nope_head_dim, kv_lora_rank]
+                        k_b_perm = k_b_local.permute(0, 2, 1)
+
+                        # v_b_local: [local_heads, v_head_dim, kv_lora_rank]
+                        # Interleave per head: concat k_nope and v for each head
+                        # -> [local_heads, qk_nope_head_dim + v_head_dim, kv_lora_rank]
+                        merged = torch.cat([k_b_perm, v_b_local], dim=1)
+
+                        # merged: [local_heads*(qk_nope+v_head), kv_lora_rank]
+                        merged = merged.reshape(-1, kv_lora_rank)
+
+                        # Build the kv_b_proj parameter name
+                        kv_b_name = name.replace("k_b_proj", "kv_b_proj").replace(
+                            "v_b_proj", "kv_b_proj")
+                        # kv_b_proj.weight is the target, but GGUF init
+                        # created qweight/qweight_type instead. Replace
+                        # with a plain weight parameter.
+                        weight_name = kv_b_name.replace(".weight", "")
+                        parts = weight_name.split(".")
+                        mod = self
+                        for p in parts:
+                            if p.isdigit():
+                                mod = mod[int(p)]
+                            else:
+                                mod = getattr(mod, p)
+                        from vllm.model_executor.layers.linear import (
+                            UnquantizedLinearMethod,
+                        )
+                        if hasattr(mod, "qweight"):
+                            delattr(mod, "qweight")
+                        if hasattr(mod, "qweight_type"):
+                            delattr(mod, "qweight_type")
+                        # Move to the same device as other params
+                        device = next(mod.parameters()).device if len(list(mod.parameters())) > 0 else torch.device("cuda")
+                        merged = merged.to(device)
+                        weight_param = torch.nn.Parameter(
+                            merged, requires_grad=False)
+                        mod.register_parameter("weight", weight_param)
+                        mod.quant_method = UnquantizedLinearMethod()
+                        loaded_params.add(kv_b_name)
+                        logger.info(
+                            "Merged k_b+v_b -> %s shape=%s "
+                            "(tp_rank=%d, heads %d-%d of %d)",
+                            kv_b_name, merged.shape,
+                            tp_rank, head_start, head_end, num_heads)
+                        del k_b_v_b_buffer[layer_idx]
+                    continue
 
             spec_layer = get_spec_layer_idx_from_weight_name(self.config, name)
             if spec_layer is not None:
