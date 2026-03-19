@@ -2126,14 +2126,14 @@ class MLACommonImpl(MLAAttentionImpl[M], Generic[M]):
             self._run_prefill_context_chunk = self._run_prefill_context_chunk_cudnn
             self._run_prefill_new_tokens = self._run_prefill_new_tokens_cudnn
             self._pad_v = False
-        else:  # Use FlashAttention
-            if flash_attn_varlen_func is None:
-                raise RuntimeError(
-                    "MLA attention requires FlashAttention but it is not "
-                    "available. Please install flash_attn or use "
-                    "--attention-backend ROCM_AITER_MLA."
-                )
-            logger.info_once("Using FlashAttention prefill for MLA", scope="local")
+        else:  # Use FlashAttention or SDPA fallback
+            _fa_func = flash_attn_varlen_func
+            if _fa_func is None:
+                from vllm.model_executor.layers.attention.sdpa_flash_attn_shim import sdpa_flash_attn_varlen_func
+                _fa_func = sdpa_flash_attn_varlen_func
+                logger.info_once("FlashAttention not available, using SDPA fallback for MLA prefill", scope="local")
+            else:
+                logger.info_once("Using FlashAttention prefill for MLA", scope="local")
             self._run_prefill_context_chunk = self._run_prefill_context_chunk_fa
             self._run_prefill_new_tokens = self._run_prefill_new_tokens_fa
 
@@ -2141,7 +2141,7 @@ class MLACommonImpl(MLAAttentionImpl[M], Generic[M]):
             # flash_attn and the one from vllm_flash_attn. The former is used on
             # RoCM and the latter has an additional parameter to control
             # FA2 vs FA3
-            self.flash_attn_varlen_func = flash_attn_varlen_func
+            self._fa_func = _fa_func
             self.vllm_flash_attn_version = get_flash_attn_version(
                 head_size=self.qk_head_dim
             )
