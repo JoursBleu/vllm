@@ -115,6 +115,14 @@ class GGUFModelLoader(BaseModelLoader):
                 gguf_to_hf_name_map[f"blk.{idx}.ffn_up_exps.weight"] = (
                     f"model.layers.{idx}.mlp.experts.0.up_proj.weight"
                 )
+                # Map split k_b/v_b tensors (some GGUFs store them
+                # separately instead of merged attn_kv_b)
+                gguf_to_hf_name_map[f"blk.{idx}.attn_k_b.weight"] = (
+                    f"model.layers.{idx}.self_attn.k_b_proj.weight"
+                )
+                gguf_to_hf_name_map[f"blk.{idx}.attn_v_b.weight"] = (
+                    f"model.layers.{idx}.self_attn.v_b_proj.weight"
+                )
                 sideload_params.append(
                     re.compile(
                         f"model\\.layers\\.{idx}"

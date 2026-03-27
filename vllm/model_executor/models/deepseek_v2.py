@@ -1415,9 +1415,40 @@ class DeepseekV2ForCausalLM(
 
         params_dict = dict(self.named_parameters())
         loaded_params: set[str] = set()
+
+        # Buffer for split k_b/v_b tensors from GGUF files that store
+        # them separately instead of a merged attn_kv_b.
+        _kv_b_buffers: dict[str, dict[str, torch.Tensor]] = {}
+
         for name, loaded_weight in weights:
             if "rotary_emb.inv_freq" in name:
                 continue
+
+            # Handle split k_b/v_b → kv_b_proj merge
+            if ".k_b_proj." in name or ".v_b_proj." in name:
+                kv_b_name = name.replace(
+                    ".k_b_proj.", ".kv_b_proj."
+                ).replace(
+                    ".v_b_proj.", ".kv_b_proj."
+                )
+                if kv_b_name not in _kv_b_buffers:
+                    _kv_b_buffers[kv_b_name] = {}
+                component = "k_b" if ".k_b_proj." in name else "v_b"
+                _kv_b_buffers[kv_b_name][component] = loaded_weight
+                if len(_kv_b_buffers[kv_b_name]) < 2:
+                    continue  # wait for the other component
+                buf = _kv_b_buffers.pop(kv_b_name)
+                k_b = buf["k_b"]
+                v_b = buf["v_b"]
+                # k_b: [num_heads, kv_lora_rank, qk_nope_head_dim]
+                # v_b: [kv_lora_rank, num_heads, v_head_dim]
+                k_b = k_b.permute(0, 2, 1)
+                v_b = v_b.permute(1, 2, 0)
+                # cat per head: [heads, qk_nope+v_head, kv_lora_rank]
+                kv_b = torch.cat([k_b, v_b], dim=1)
+                # reshape: [heads*(qk_nope+v_head), kv_lora_rank]
+                loaded_weight = kv_b.reshape(-1, kv_b.shape[-1])
+                name = kv_b_name
 
             spec_layer = get_spec_layer_idx_from_weight_name(self.config, name)
             if spec_layer is not None:

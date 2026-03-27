@@ -986,6 +986,11 @@ def gguf_quant_weights_iterator(
             weight_type = tensor.tensor_type
             name = gguf_to_hf_name_map[tensor.name]
 
+            # Skip qweight_type for split k_b/v_b — they will be
+            # dequantized and merged into kv_b_proj later.
+            if ".k_b_proj." in name or ".v_b_proj." in name:
+                continue
+
             if weight_type.name not in ("F32", "BF16", "F16"):
                 weight_type_name = name.replace("weight", "qweight_type")
                 weight_type = torch.tensor(weight_type)
@@ -996,6 +1001,16 @@ def gguf_quant_weights_iterator(
             weight = tensor.data
             weight_type = tensor.tensor_type
             name = gguf_to_hf_name_map[tensor.name]
+
+            # Force dequantize split k_b/v_b so they can be merged
+            # into kv_b_proj in load_weights().
+            if ".k_b_proj." in name or ".v_b_proj." in name:
+                if weight_type.name not in ("F32", "BF16", "F16"):
+                    weight = gguf.dequantize(weight, weight_type)
+                yield name, torch.from_numpy(
+                    np.copy(weight)).to(torch.float16)
+                continue
+
             if weight_type.name not in ("F32", "BF16", "F16"):
                 name = name.replace("weight", "qweight")
             if weight_type.name == "BF16" and tensor.data.dtype == np.uint8:
