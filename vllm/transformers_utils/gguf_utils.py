@@ -20,6 +20,32 @@ logger = init_logger(__name__)
 
 
 @cache
+def get_all_gguf_files(model_path: str) -> list[str]:
+    """Discover all GGUF shard files from a single shard path.
+
+    Supports variable-width shard indices by dynamically detecting
+    the padding from the original filename.
+    E.g. ``*-00001-of-00005.gguf`` -> all 5 shards,
+         ``*-01-of-15.gguf`` -> all 15 shards.
+    """
+    match = re.search(r"-(\d+)-of-(\d+)\.gguf$", model_path)
+    if not match:
+        return [model_path]
+    total = int(match.group(2))
+    num_digits = len(match.group(1))
+    prefix = model_path[: match.start(1)]
+    suffix = model_path[match.end(2) :]
+    files = []
+    for i in range(1, total + 1):
+        shard_path = f"{prefix}{i:0{num_digits}d}-of-{total:0{num_digits}d}{suffix}"
+        if Path(shard_path).is_file():
+            files.append(shard_path)
+    if files:
+        logger.info("Discovered %d GGUF shard files", len(files))
+    return files if files else [model_path]
+
+
+@cache
 def check_gguf_file(model: str | PathLike) -> bool:
     """Check if the file is a GGUF model."""
     model = Path(model)

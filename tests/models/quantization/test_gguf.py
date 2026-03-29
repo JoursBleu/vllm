@@ -9,7 +9,7 @@ import os
 from typing import NamedTuple
 
 import pytest
-from huggingface_hub import hf_hub_download
+from huggingface_hub import hf_hub_download, snapshot_download
 from pytest import MarkDecorator
 from transformers import AutoTokenizer
 
@@ -194,6 +194,50 @@ def test_distributed(
     vllm_runner: type[VllmRunner],
     example_prompts: list[str],
     model: GGUFTestConfig,
+    dtype: str,
+    max_tokens: int,
+    num_logprobs: int,
+    tp_size: int,
+) -> None:
+    check_model_outputs(
+        vllm_runner, example_prompts, model, dtype, max_tokens, num_logprobs, tp_size
+    )
+
+
+class ShardedGGUFTestConfig(NamedTuple):
+    original_model: str
+    gguf_repo: str
+    gguf_filename: str
+    marks: list[MarkDecorator] = []
+
+    @property
+    def gguf_model(self):
+        # Download all shards so the loader can discover them
+        import os
+        repo_dir = snapshot_download(self.gguf_repo, allow_patterns="*.gguf")
+        return os.path.join(repo_dir, self.gguf_filename)
+
+
+SHARDED_QWEN3_CONFIG = ShardedGGUFTestConfig(
+    original_model="Qwen/Qwen3-1.7B",
+    gguf_repo="Felladrin/gguf-sharded-UD-Q4_K_XL-Qwen3-1.7B",
+    gguf_filename="model.shard-00001-of-00005.gguf",
+)
+
+
+@pytest.mark.skipif(
+    not is_quant_method_supported("gguf"),
+    reason="gguf is not supported on this GPU type.",
+)
+@pytest.mark.parametrize("model", [SHARDED_QWEN3_CONFIG])
+@pytest.mark.parametrize("dtype", ["half"])
+@pytest.mark.parametrize("max_tokens", [32])
+@pytest.mark.parametrize("num_logprobs", [5])
+@pytest.mark.parametrize("tp_size", [1])
+def test_sharded_gguf(
+    vllm_runner: type[VllmRunner],
+    example_prompts: list[str],
+    model: ShardedGGUFTestConfig,
     dtype: str,
     max_tokens: int,
     num_logprobs: int,
