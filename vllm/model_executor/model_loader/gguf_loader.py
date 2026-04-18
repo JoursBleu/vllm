@@ -2,7 +2,6 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import os
 from collections.abc import Generator
-from typing import TYPE_CHECKING, cast
 
 import gguf
 import regex as re
@@ -28,9 +27,6 @@ from vllm.model_executor.model_loader.weight_utils import (
 from vllm.transformers_utils.gguf_utils import detect_gguf_multimodal
 from vllm.utils.torch_utils import set_default_torch_dtype
 
-if TYPE_CHECKING:
-    from vllm.model_executor.layers.quantization.gguf import GGUFConfig
-
 logger = init_logger(__name__)
 
 
@@ -53,6 +49,11 @@ class GGUFModelLoader(BaseModelLoader):
         model_name_or_path = model_config.model
         if os.path.isfile(model_name_or_path):
             return model_name_or_path
+        # for raw HTTPS link
+        if model_name_or_path.startswith(
+            ("http://", "https://")
+        ) and model_name_or_path.endswith(".gguf"):
+            return hf_hub_download(url=model_name_or_path)
         # repo id/filename.gguf
         if "/" in model_name_or_path and model_name_or_path.endswith(".gguf"):
             repo_id, filename = model_name_or_path.rsplit("/", 1)
@@ -70,7 +71,7 @@ class GGUFModelLoader(BaseModelLoader):
 
         raise ValueError(
             f"Unrecognised GGUF reference: {model_name_or_path} "
-            "(expected local file, <repo_id>/<filename>.gguf, "
+            "(expected local file, raw URL, <repo_id>/<filename>.gguf, "
             "or <repo_id>:<quant_type>)"
         )
 
@@ -102,6 +103,16 @@ class GGUFModelLoader(BaseModelLoader):
             # Gemma3 models use "gemma3_text" in HuggingFace but
             # "gemma3" in GGUF architecture naming
             model_type = "gemma3"
+        if model_type == "gemma4_text":
+            model_type = "gemma3"
+            for idx in range(config.num_hidden_layers):
+                gguf_to_hf_name_map[f"blk.{idx}.layer_output_scale.weight"] = (
+                    f"model.layers.{idx}.layer_scalar"
+                )
+            for idx in range(config.num_hidden_layers):
+                gguf_to_hf_name_map[f"blk.{idx}.layer_output_scale.weight"] = (
+                    f"model.layers.{idx}.layer_scalar"
+                )
         if model_type in ("deepseek_v3", "deepseek_v2"):
             model_type = "deepseek2"
             # GGUF layer map assumes that we will have a merged expert weights
@@ -354,9 +365,10 @@ class GGUFModelLoader(BaseModelLoader):
             for name, weight_type in weight_type_map.items()
             if weight_type in ("F32", "F16", "BF16") and name.endswith(".weight")
         ]
-        logger.debug("GGUF unquantized modules: %s", unquant_names)
-        if TYPE_CHECKING:
-            vllm_config.quant_config = cast(GGUFConfig, vllm_config.quant_config)
+        logger.debug(
+            "GGUF unquantized modules: %s",
+            unquant_names,
+        )
         vllm_config.quant_config.unquantized_modules.extend(unquant_names)
 
         target_device = torch.device(device_config.device)
