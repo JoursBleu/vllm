@@ -22,6 +22,7 @@ from vllm.model_executor.layers.fused_moe.config import (
     FusedMoEParallelConfig,
     FusedMoEQuantConfig,
     fp8_w8a8_moe_quant_config,
+    int8_w8a8_moe_quant_config,
     mxfp4_w4a8_moe_quant_config,
     mxfp4_w4a16_moe_quant_config,
     ocp_mx_moe_quant_config,
@@ -720,6 +721,22 @@ class QuarkW8A8Int8MoEMethod(QuarkMoEMethod):
                 layer.w2_input_scale.max(), requires_grad=False
             )
 
+        # Per-channel scales arrive as 2D ``[E, N]`` from the safetensors
+        # loader; the modular int8 MoE kernel expects 3D ``[E, N, 1]``
+        # (matching CompressedTensorsW8A8Int8MoEMethod).
+        if self.weight_qscheme == "per_channel":
+            for attr in ("w13_weight_scale", "w2_weight_scale"):
+                param = getattr(layer, attr, None)
+                if param is not None and param.dim() == 2:
+                    replace_parameter(
+                        layer,
+                        attr,
+                        torch.nn.Parameter(
+                            param.data.unsqueeze(-1).contiguous(),
+                            requires_grad=False,
+                        ),
+                    )
+
         # For per-tensor weights, merge w1/w3 scales into single per-expert
         if self.weight_qscheme == "per_tensor":
             assert layer.w13_weight_scale is not None
@@ -748,6 +765,19 @@ class QuarkW8A8Int8MoEMethod(QuarkMoEMethod):
     def get_fused_moe_quant_config(
         self, layer: torch.nn.Module
     ) -> FusedMoEQuantConfig | None:
+        # Per-channel weight + dynamic per-token activation goes through
+        # the same path as CompressedTensorsW8A8Int8MoEMethod so the
+        # modular int8 MoE kernel sees an identical config.
+        if self.weight_qscheme == "per_channel" and not self.static_input_scales:
+            return int8_w8a8_moe_quant_config(
+                w1_scale=layer.w13_weight_scale,
+                w2_scale=layer.w2_weight_scale,
+                a1_scale=layer.w13_input_scale,
+                a2_scale=layer.w2_input_scale,
+                w1_bias=getattr(layer, "w13_bias", None),
+                w2_bias=getattr(layer, "w2_bias", None),
+                per_act_token_quant=True,
+            )
         is_dynamic = not self.static_input_scales
         is_per_channel = self.weight_qscheme == "per_channel"
         return FusedMoEQuantConfig.make(

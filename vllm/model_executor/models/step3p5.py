@@ -817,6 +817,19 @@ class Step3p5Model(nn.Module):
 
 
 class Step3p5ForCausalLM(nn.Module, SupportsPP, MixtureOfExperts):
+    # vLLM fuses q_proj/k_proj/v_proj into qkv_proj and gate_proj/up_proj
+    # into gate_up_proj for both the dense MLP and the shared expert. This
+    # mapping is consumed by ``configure_quant_config`` so that quantization
+    # ``exclude``/``ignore`` lists referring to the unfused proj names also
+    # match the fused module prefixes (otherwise, e.g. Quark exclude entries
+    # ``...share_expert.gate_proj`` / ``...share_expert.up_proj`` would not
+    # match the fused ``...share_expert.gate_up_proj`` and the layer would
+    # be incorrectly treated as quantized).
+    packed_modules_mapping = {
+        "qkv_proj": ["q_proj", "k_proj", "v_proj"],
+        "gate_up_proj": ["gate_proj", "up_proj"],
+    }
+
     hf_to_vllm_mapper = WeightsMapper(
         orig_to_new_substr={".share_expert.": ".moe.share_expert."}
     )
