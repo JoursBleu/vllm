@@ -27,3 +27,11 @@ tilelang==0.1.10
 apache-tvm-ffi==0.1.10 
 # Required for faster safetensors model loading
 fastsafetensors >= 0.3.2
+
+# amdsmi drop-in for WSL2. Under WSL2 the AMD GPU is exposed through DirectX
+# para-virtualization (/dev/dxg) rather than the KFD driver, so the native
+# amdsmi cannot run and `import amdsmi` fails. This package re-implements the
+# amdsmi surface vLLM needs on top of the HIP runtime, so the normal ROCm code
+# paths work with no WSL-specific fallbacks. The marker keeps it off bare-metal
+# Linux, where the native amdsmi from the ROCm install must be used instead.
+amd-smi-wsl>=0.3.0; "microsoft" in platform_release or "WSL" in platform_release

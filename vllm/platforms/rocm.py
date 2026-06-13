@@ -169,20 +169,17 @@ def _query_gcn_arch_from_amdsmi() -> str:
 
 def _get_gcn_arch() -> str:
     """
-    Get GCN arch via amdsmi (no CUDA init), fallback to torch.cuda.
+    Get GCN arch via amdsmi (no CUDA init).
     Called once at module level; result stored in _GCN_ARCH.
+
+    amdsmi is always available on ROCm: the native library on bare-metal
+    Linux, and the ``amd-smi-wsl`` drop-in (declared as a ROCm dependency,
+    installed only under WSL2) where the native library cannot run because the
+    GPU is exposed through DirectX para-virtualization instead of the KFD
+    driver. There is therefore no torch.cuda fallback, which keeps CUDA
+    un-initialized at import time (important for Ray workers / Dynamo).
     """
-    try:
-        return _query_gcn_arch_from_amdsmi()
-    except Exception as e:
-        logger.debug("Failed to get GCN arch via amdsmi: %s", e)
-        logger.warning_once(
-            "Failed to get GCN arch via amdsmi, falling back to torch.cuda. "
-            "This will initialize CUDA and may cause "
-            "issues if CUDA_VISIBLE_DEVICES is not set yet."
-        )
-    # Ultimate fallback: use torch.cuda (will initialize CUDA)
-    return torch.cuda.get_device_properties("cuda").gcnArchName
+    return _query_gcn_arch_from_amdsmi()
 
 
 # Resolve once at module load. Uses amdsmi (no CUDA init) so Ray workers
@@ -664,17 +661,13 @@ class RocmPlatform(Platform):
     @classmethod
     @lru_cache(maxsize=8)
     def get_device_capability(cls, device_id: int = 0) -> DeviceCapability | None:
+        # _GCN_ARCH comes from amdsmi (native or the amd-smi-wsl drop-in), so it
+        # is always a valid gfx string here; derive the capability from it
+        # without ever initializing CUDA via torch.cuda.
         cap = _capability_from_gcn_arch(_GCN_ARCH)
         if cap is not None:
             return DeviceCapability(major=cap[0], minor=cap[1])
-
-        logger.warning_once(
-            "Could not derive device capability from GCN arch '%s', "
-            "falling back to torch.cuda (this will initialize CUDA).",
-            _GCN_ARCH,
-        )
-        major, minor = torch.cuda.get_device_capability(device_id)
-        return DeviceCapability(major=major, minor=minor)
+        return None
 
     @classmethod
     @with_amdsmi_context
