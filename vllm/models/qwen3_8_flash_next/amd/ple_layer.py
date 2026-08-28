@@ -33,7 +33,7 @@ from vllm.v1.attention.backends.short_conv_attn import (
 )
 from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
 
-from ..common.ple import copy_ple_embedding_shard_
+from ..common.ple import compute_ple_shard_overlap, copy_ple_embedding_shard_
 
 _MASK64 = (1 << 64) - 1
 _SPLITMIX_GAMMA = 0x9E3779B97F4A7C15
@@ -323,10 +323,21 @@ class Qwen3_8FlashNextNGramEmbedding(nn.Module):
         loaded: set[str] = set()
         regular_weights: list[tuple[str, torch.Tensor]] = []
         shard_prefix = "ngram_embedding.shard_"
+        # The FP8 checkpoint stores the n-gram table as fp8_e4m3 shards plus one
+        # per-tensor scale, while ngram_embedding is built unquantized. Shards
+        # arrive across several load_weights calls, so track which destination
+        # rows still need dequantizing instead of scaling the whole table.
+        if not hasattr(self, "_ngram_scale"):
+            self._ngram_scale = None
+            self._ngram_unscaled_rows = []
 
         for name, loaded_weight in weights:
             leaf_name = name.rsplit(".", 1)[-1]
             if leaf_name.startswith("hashstats_") or leaf_name == "token_lookup":
+                continue
+            if name == "ngram_embedding.weight_scale":
+                self._ngram_scale = loaded_weight
+                loaded.add(name)
                 continue
             if name in persistent_buffers:
                 buffer = persistent_buffers[name]
@@ -372,9 +383,29 @@ class Qwen3_8FlashNextNGramEmbedding(nn.Module):
                     tp_start=embedding.shard_indices.org_vocab_start_index,
                     tp_end=embedding.shard_indices.org_vocab_end_index,
                 )
+                overlap = compute_ple_shard_overlap(
+                    checkpoint_start=checkpoint_start,
+                    checkpoint_rows=loaded_weight.shape[0],
+                    tp_start=embedding.shard_indices.org_vocab_start_index,
+                    tp_end=embedding.shard_indices.org_vocab_end_index,
+                )
+                if overlap is not None and overlap.row_count > 0:
+                    self._ngram_unscaled_rows.append(
+                        (overlap.destination_start, overlap.row_count)
+                    )
                 loaded.add("ngram_embedding.weight")
                 continue
             regular_weights.append((name, loaded_weight))
+
+        if self._ngram_scale is not None and self._ngram_unscaled_rows:
+            weight_data = self.ngram_embedding.weight.data
+            scale = self._ngram_scale.to(
+                device=weight_data.device, dtype=weight_data.dtype
+            ).reshape(())
+            with torch.no_grad():
+                for start, rows in self._ngram_unscaled_rows:
+                    weight_data.narrow(0, start, rows).mul_(scale)
+            self._ngram_unscaled_rows = []
 
         if regular_weights:
             loaded.update(AutoWeightsLoader(self).load_weights(regular_weights))

@@ -18,6 +18,18 @@ if HAS_TRITON:
 logger = init_logger(__name__)
 
 
+def _aiter_sampler_disabled_by_env() -> bool:
+    """Allow opting out of aiter's sampler without disabling aiter entirely.
+
+    aiter's ``top_k_top_p_sampling_from_probs`` segfaults on gfx942 with the
+    ROCm 7.2 builds we ship, while the rest of aiter is still required for
+    attention and MoE.  Upstream has no per-op switch, so gate it here.
+    """
+    import os
+
+    return os.environ.get("VLLM_ROCM_USE_AITER_SAMPLER", "1") == "0"
+
+
 def flashinfer_sampler_supported() -> bool:
     """Decide whether FlashInfer's top-p/top-k sampler can be used.
 
@@ -110,6 +122,7 @@ class TopKTopPSampler(nn.Module):
         elif (
             logprobs_mode not in ("processed_logits", "processed_logprobs")
             and rocm_aiter_ops.is_enabled()
+            and not _aiter_sampler_disabled_by_env()
         ):
             self.aiter_ops = None
             self._aiter_ops_import_failed = False
